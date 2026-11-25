@@ -1,4 +1,5 @@
 from collections import deque
+from typing import Callable
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -22,7 +23,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self, on_preempt: Callable[[int], None] | None = None) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -59,9 +60,9 @@ class Scheduler:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self.preempt(self.running.pop(), on_preempt=on_preempt)
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq, on_preempt=on_preempt)
                     break
             else:
                 seq.num_scheduled_tokens = 1
@@ -72,11 +73,13 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
-    def preempt(self, seq: Sequence):
+    def preempt(self, seq: Sequence, on_preempt: Callable[[int], None] | None = None):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+        if on_preempt is not None:
+            on_preempt(seq.seq_id)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):

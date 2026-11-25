@@ -1,6 +1,7 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
+from typing import Callable
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -10,6 +11,19 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+
+@dataclass(frozen=True)
+class StepTrace:
+    """CPU execution boundaries and immutable snapshots for one engine step."""
+
+    start_time: float
+    end_time: float
+    is_prefill: bool
+    selected_seq_ids: tuple[int, ...]
+    decode_waiting_seq_ids: tuple[int, ...]
+    processed_tokens: int
+    preempted_seq_ids: tuple[int, ...]
 
 
 class LLMEngine:
@@ -47,12 +61,46 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq.seq_id
 
-    def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
+    def step(
+        self,
+        on_token: Callable[[int, float], None] | None = None,
+        on_step: Callable[[StepTrace], None] | None = None,
+    ):
+        """Advance one batch with optional token and step observations.
+
+        Step timing covers scheduling through completion-result collection.
+        Observers run after the end timestamp has been captured.
+        """
+        start_time = perf_counter() if on_step is not None else 0.0
+        decode_waiting_seq_ids = (
+            tuple(seq.seq_id for seq in self.scheduler.running) if on_step is not None else ()
+        )
+        preempted_seq_ids: list[int] = []
+        seqs, is_prefill = self.scheduler.schedule(
+            on_preempt=preempted_seq_ids.append if on_step is not None else None,
+        )
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        selected_seq_ids = tuple(seq.seq_id for seq in seqs) if on_step is not None else ()
+        previous_output_counts = [seq.num_completion_tokens for seq in seqs] if on_token is not None else []
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        end_time = perf_counter() if on_token is not None or on_step is not None else 0.0
+        if on_token is not None:
+            for seq, previous_count in zip(seqs, previous_output_counts):
+                # Intermediate prefill chunks do not append an output token.
+                if seq.num_completion_tokens > previous_count:
+                    on_token(seq.seq_id, end_time)
+        if on_step is not None:
+            on_step(StepTrace(
+                start_time=start_time,
+                end_time=end_time,
+                is_prefill=is_prefill,
+                selected_seq_ids=selected_seq_ids,
+                decode_waiting_seq_ids=decode_waiting_seq_ids,
+                processed_tokens=abs(num_tokens),
+                preempted_seq_ids=tuple(preempted_seq_ids),
+            ))
         return outputs, num_tokens
 
     def is_finished(self):
