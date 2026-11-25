@@ -17,7 +17,9 @@ def generate_random_requests(
     max_output_len: int = 1024,
     time_interval: int = 30,
     seed: int = 0,
+    arrival_pattern: str = "random",
 ):
+    """Generate identical request contents across random and all-at-once arrivals."""
     if num_seqs < 0:
         raise ValueError("num_seqs must be >= 0")
     if time_interval <= 0:
@@ -26,6 +28,8 @@ def generate_random_requests(
         raise ValueError("max_input_len must be >= 100")
     if max_output_len < 100:
         raise ValueError("max_output_len must be >= 100")
+    if arrival_pattern not in ("random", "all-at-once"):
+        raise ValueError("arrival_pattern must be 'random' or 'all-at-once'")
 
     rng = Random(seed)
     request_list =[]
@@ -41,6 +45,11 @@ def generate_random_requests(
         sampling_params = sampling_params,
       )
       request_list.append(request)
+
+    # Draw the same random values in both modes before changing arrival times.
+    if arrival_pattern == "all-at-once":
+        for request in request_list:
+            request.arrival_time = 0
 
     request_list.sort(key=lambda request: (request.arrival_time, request.request_id))
     return request_list
