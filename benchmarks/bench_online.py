@@ -11,7 +11,7 @@ import numpy as np
 
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.llm_engine import StepTrace
-from benchmarks.trace import ITLAnalysis, StepRecord, analyze_longest_itls
+from benchmarks.trace import StepRecord, analyze_longest_itls
 from benchmarks.workloads import RequestSpec, generate_random_requests
 
 
@@ -38,6 +38,12 @@ class RequestResult:
     @property
     def itls(self) -> list[float]:
         return [current - previous for previous, current in zip(self.token_times, self.token_times[1:])]
+
+    @property
+    def tpot(self) -> float | None:
+        if self.output_tokens <= 1:
+            return None
+        return (self.token_times[-1] - self.token_times[0]) / (self.output_tokens - 1)
 
     @property
     def end_to_end_latency(self) -> float:
@@ -131,52 +137,38 @@ def run_benchmark(
     return results, results[-1].completed_time
 
 
-def print_latency_summary(name: str, values: list[float]):
-    """Print latency samples in milliseconds using linearly interpolated percentiles."""
+def summarize_latency(values: list[float]) -> dict[str, float | int | None]:
+    """Summarize seconds as milliseconds using linearly interpolated percentiles."""
     if not values:
+        return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "samples": 0}
+
+    p50, p95, p99 = (np.percentile(values, [50, 95, 99]) * 1000).tolist()
+    return {
+        "mean": fmean(values) * 1000,
+        "p50": p50,
+        "p95": p95,
+        "p99": p99,
+        "max": max(values) * 1000,
+        "samples": len(values),
+    }
+
+
+def print_latency_summary(name: str, stats: dict[str, float | int | None], *, show_max: bool = False):
+    if not stats["samples"]:
         print(f"{name}: N/A (no samples)")
         return
 
-    p50, p95, p99 = np.percentile(values, [50, 95, 99])
-    print(
-        f"{name} (ms): mean={fmean(values) * 1000:.3f}, "
-        f"P50={p50 * 1000:.3f}, P95={p95 * 1000:.3f}, P99={p99 * 1000:.3f}, "
-        f"max={max(values) * 1000:.3f}, samples={len(values)}"
-    )
+    line = f"{name} (ms): mean={stats['mean']:.3f}, P95={stats['p95']:.3f}"
+    if show_max:
+        line += f", max={stats['max']:.3f}"
+    print(line)
 
 
-def print_itl_analysis(analyses: list[ITLAnalysis], steps: list[StepRecord]):
-    if not analyses:
-        print("Longest ITLs: no intervals selected")
-        return
-
-    steps_by_id = {step.step_id: step for step in steps}
-    for rank, interval in enumerate(analyses, start=1):
-        print(
-            f"Longest ITL #{rank}: request={interval.request_id}, "
-            f"tokens={interval.from_token}->{interval.to_token}, "
-            f"window=[{interval.start_time:.6f}, {interval.end_time:.6f}]s, "
-            f"duration={interval.duration * 1000:.3f}ms"
-        )
-        print(
-            f"  Overlap: prefill={interval.prefill_time * 1000:.3f}ms, "
-            f"decode={interval.decode_time * 1000:.3f}ms, "
-            f"outside_steps={interval.outside_step_time * 1000:.3f}ms, "
-            f"prefill_while_waiting={interval.prefill_wait_time * 1000:.3f}ms, "
-            f"preemptions={interval.preemption_count}, "
-            f"request_preemptions={interval.request_preemption_count}"
-        )
-        for step_id in interval.step_ids:
-            step = steps_by_id[step_id]
-            overlap = min(interval.end_time, step.end_time) - max(interval.start_time, step.start_time)
-            print(
-                f"  step={step.step_id}, phase={step.phase}, "
-                f"window=[{step.start_time:.6f}, {step.end_time:.6f}]s, "
-                f"duration={step.duration * 1000:.3f}ms, overlap={overlap * 1000:.3f}ms, "
-                f"batch_size={step.batch_size}, processed_tokens={step.processed_tokens}, "
-                f"request_waiting={interval.request_id in step.decode_waiting_request_ids}, "
-                f"request_selected={interval.request_id in step.selected_request_ids}"
-            )
+def write_json(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, indent=2, allow_nan=False)
+        output_file.write("\n")
 
 
 def main():
@@ -196,11 +188,23 @@ def main():
     parser.add_argument("--time-interval", type=int, default=30, help="Random-arrival window in seconds.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model", default="~/eecs442_scratch/models/Qwen3-0.6B")
+    parser.add_argument(
+        "--summary-output",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="Summary JSON path (defaults to results/<arrival-pattern>.summary.json).",
+    )
     parser.add_argument("--trace-output", type=Path, help="Enable step tracing and save the observations as JSON.")
-    parser.add_argument("--top-itls", type=int, default=5, help="Number of longest token intervals to analyze when tracing.")
+    parser.add_argument("--top-itls", type=int, default=0, help="Number of longest token intervals to analyze when tracing.")
     args = parser.parse_args()
     if args.top_itls < 0:
         parser.error("--top-itls must be >= 0")
+
+    default_summary_output = Path("results") / f"{args.arrival_pattern}.summary.json"
+    summary_output = getattr(args, "summary_output", default_summary_output).expanduser()
+    trace_output = args.trace_output.expanduser() if args.trace_output is not None else None
+    if trace_output is not None and summary_output.resolve() == trace_output.resolve():
+        parser.error("--summary-output and --trace-output must point to different files")
 
     request_list = generate_random_requests(
         num_seqs=args.num_seqs,
@@ -211,7 +215,6 @@ def main():
         arrival_pattern=args.arrival_pattern,
     )
 
-    print(f"\nArrival pattern {args.arrival_pattern}, requests={len(request_list)}, seed={args.seed}", flush=True)
     path = os.path.expanduser(args.model)
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
     llm.generate(["Benchmark: "], SamplingParams())
@@ -219,41 +222,59 @@ def main():
     results, elapsed_time = run_benchmark(
         llm,
         request_list,
-        on_step=step_records.append if args.trace_output is not None else None,
+        on_step=step_records.append if trace_output is not None else None,
     )
     total_tokens = sum(result.output_tokens for result in results)
     throughput = total_tokens / elapsed_time if elapsed_time > 0 else 0.0
-    print(
-        f"Requests: {len(results)}/{len(request_list)}, Total: {total_tokens}tok, "
-        f"Time: {elapsed_time:.2f}s, Throughput: {throughput:.2f}tok/s"
-    )
-    print_latency_summary("Submission delay", [result.submission_delay for result in results])
-    print_latency_summary("TTFT", [result.ttft for result in results if result.ttft is not None])
-    # Each adjacent-token interval contributes one sample across all requests.
-    print_latency_summary("ITL (all token intervals)", [interval for result in results for interval in result.itls])
-    print_latency_summary("End-to-end latency", [result.end_to_end_latency for result in results])
-    if args.trace_output is not None:
-        analyses = analyze_longest_itls(
-            {result.request_id: result.token_times for result in results},
-            step_records,
-            top_k=args.top_itls,
-        )
-        print_itl_analysis(analyses, step_records)
-        trace_output = args.trace_output.expanduser()
-        trace_output.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "configuration": {**vars(args), "model": path, "trace_output": str(trace_output)},
-            "elapsed_time": elapsed_time,
-            "total_output_tokens": total_tokens,
+    latency_ms = {
+        "ttft": summarize_latency([ttft for result in results if (ttft := result.ttft) is not None]),
+        "itl": summarize_latency([interval for result in results for interval in result.itls]),
+        "tpot": summarize_latency([tpot for result in results if (tpot := result.tpot) is not None]),
+        "submission_delay": summarize_latency([result.submission_delay for result in results]),
+        "end_to_end": summarize_latency([result.end_to_end_latency for result in results]),
+    }
+    summary = {
+        "configuration": {
+            **vars(args),
+            "model": path,
+            "summary_output": str(summary_output),
+            "trace_output": str(trace_output) if trace_output is not None else None,
+        },
+        "total_requests": len(request_list),
+        "completed_requests": len(results),
+        "elapsed_time": elapsed_time,
+        "total_output_tokens": total_tokens,
+        "output_tokens_per_second": throughput,
+        "latency_ms": latency_ms,
+    }
+    write_json(summary_output, summary)
+    if trace_output is not None:
+        analyses = []
+        if args.top_itls:
+            analyses = analyze_longest_itls(
+                {result.request_id: result.token_times for result in results},
+                step_records,
+                top_k=args.top_itls,
+            )
+        write_json(trace_output, {
+            **summary,
             "preemption_count": sum(len(step.preempted_request_ids) for step in step_records),
             "requests": [asdict(result) for result in results],
             "steps": [asdict(step) for step in step_records],
             "longest_itls": [asdict(interval) for interval in analyses],
-        }
-        with trace_output.open("w", encoding="utf-8") as output_file:
-            json.dump(payload, output_file, indent=2, allow_nan=False)
-            output_file.write("\n")
-        print(f"Trace saved to {trace_output}")
+        })
+
+    print(
+        f"{args.arrival_pattern} (seed={args.seed}) | Requests: {len(results)}/{len(request_list)} | "
+        f"Output: {throughput:.2f} tok/s"
+    )
+    print_latency_summary("TTFT", latency_ms["ttft"])
+    print_latency_summary("ITL", latency_ms["itl"], show_max=True)
+    print_latency_summary("TPOT", latency_ms["tpot"])
+    saved_paths = f"Summary: {summary_output}"
+    if trace_output is not None:
+        saved_paths += f" | Trace: {trace_output}"
+    print(saved_paths)
 
 
 if __name__ == "__main__":

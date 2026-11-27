@@ -40,8 +40,15 @@ python -m benchmarks.bench_online --arrival-pattern all-at-once
 
 Each invocation runs one experiment and initializes and warms up its own model.
 Use identical workload arguments for both runs to compare the same requests.
-Each run prints its arrival pattern and full metric summary. Initialization and
-warmup are outside the measured interval.
+The warmup progress bar is followed by five lines showing completed requests,
+output throughput, TTFT, ITL, TPOT, and output paths. Initialization and warmup
+are outside the measured interval.
+
+Each run saves a summary to `results/<arrival-pattern>.summary.json` by default.
+Running the same arrival pattern again replaces that summary. Use
+`--summary-output PATH` to keep separate runs. The summary includes the benchmark
+arguments, request counts, elapsed time in seconds, throughput, and latency
+statistics, including submission delay and end-to-end latency.
 
 Adjust the workload configuration through command-line arguments.
 
@@ -63,15 +70,18 @@ batch's postprocessing. Completion time is the last output token's timestamp.
 | Submission delay | Actual submission time minus planned arrival time |
 | TTFT | First output token time minus planned arrival time |
 | ITL | Time between adjacent output tokens of the same request |
+| TPOT | Per-request time from the first to the last output token divided by the number of intervals |
 | End-to-end latency | Completion time minus planned arrival time |
 | Output throughput | Actual total output tokens divided by time from benchmark start to last completion, including idle waits |
 
-Latency summaries report the mean, P50, P95, P99, maximum, and sample count in
-milliseconds. Percentiles use NumPy's linear interpolation. Submission delay,
-TTFT, and end-to-end latency contribute one sample per request. ITL pools every
-adjacent-token interval across requests, so longer outputs contribute more
-samples. Single-token outputs contribute zero ITL samples. Empty summaries show
-`N/A`, and an empty workload has zero output throughput.
+The console shows the mean and P95 for TTFT, ITL, and TPOT in milliseconds, plus
+the maximum for ITL. The summary JSON also stores P50, P99, maximum, and sample
+count for every latency metric. Percentiles use NumPy's linear interpolation.
+ITL pools all adjacent-token intervals, so longer outputs contribute more
+samples. TPOT contributes one sample for each request with at least two output
+tokens. Single-token requests still contribute to TTFT and throughput. Empty
+metrics show `N/A` on the console and `null` statistics in JSON, and an empty
+workload has zero output throughput.
 
 ## Scheduler Observations
 
@@ -83,10 +93,10 @@ python -m benchmarks.bench_online --arrival-pattern random --trace-output result
 python -m benchmarks.bench_online --arrival-pattern all-at-once --trace-output results/all_at_once.json
 ```
 
-The JSON file contains the configuration, per-request token timestamps, all step
-records, total preemption count, and analysis of the longest ITLs. Collection
+The trace JSON also contains per-request token timestamps, all step records,
+total preemption count, and optional analysis of the longest ITLs. Collection
 uses in-memory records during execution. Analysis, console reporting, and JSON
-writing happen after the measured run. Each invocation writes the chosen file.
+writing happen after the measured run.
 
 | Step field | Definition |
 | --- | --- |
@@ -106,18 +116,18 @@ includes scheduling, data preparation, model execution, sampling, postprocessing
 and completion-result collection. Observer callbacks execute after the end
 timestamp. Tracing introduces CPU overhead, which can affect measured latency.
 
-`--top-itls` selects how many longest intervals to analyze, defaulting to 5. Token
-positions in this analysis are one-based. Each interval lists its overlapping
-steps and clips each overlap to the interval boundaries. The report includes
-prefill time, decode time, time outside recorded steps, and `prefill_wait_time`.
+`--top-itls` defaults to 0. Pass a positive value with `--trace-output` to save
+the attribution for that many longest intervals in the trace's `longest_itls`
+field. Token positions are one-based. Each interval lists its overlapping steps
+and clips each overlap to the interval boundaries. The report includes prefill
+time, decode time, time outside recorded steps, and `prefill_wait_time`.
 The last quantity counts prefill overlap while the affected request was in the
 decode-waiting snapshot and absent from that step's selected batch. Preemption
 counts refer to events in overlapping steps, with a separate count for the
 affected request. These observations locate scheduling delays and cache-related
 interruptions for further investigation.
 
-Use `--top-itls 0` to save the full trace without selecting intervals. Omitting
-`--trace-output` runs the core metrics benchmark with step tracing disabled.
+Omit `--trace-output` for performance runs with step tracing disabled.
 
 ## Experiment Results
 
