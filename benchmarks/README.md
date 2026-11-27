@@ -12,6 +12,8 @@ request that's already decoding.
 - `bench_online.py`: Simulate requests arriving over time, run the benchmark, and summarize results.
 - `workloads.py`: Generate request input lengths, output lengths, and arrival times.
 - `plot_long_prefill.py`: Verify decode overlap and plot request A's ITL from a trace.
+- `bench_prefill.py`: Measure single-request prefill across prompt lengths.
+- `plot_prefill.py`: Plot throughput and median step latency from a prefill sweep.
 - `bench.py` in the repository root: The existing offline benchmark.
 
 ## Environment and Baseline Version
@@ -96,6 +98,17 @@ window on your machine, choose a delay inside the reported window with
 The dashed line marks B's planned arrival and the shaded intervals show the steps
 that run B before its first output token. Each ITL is plotted at the time its
 second token is observed.
+
+### Single-Request Prefill Sweep
+
+```bash
+python -m benchmarks.bench_prefill --input-lengths 64 128 256 512 1024 1536 2048 2560 3072 3584 4096
+python -m benchmarks.plot_prefill results/prefill.summary.json --output results/prefill.sweep.png
+```
+
+The plot requires `gnuplot` with `pngcairo`. The vertical line marks the highest
+measured input throughput and lets you compare its step latency with shorter
+prompt lengths when choosing candidate chunk sizes.
 
 ## Metric Definitions
 

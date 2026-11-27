@@ -75,3 +75,20 @@ def generate_long_prefill_requests(delay_ms: float, seed: int = 0) -> list[Reque
         )
         for request_id, arrival_time, prompt_length, output_length in requests
     ]
+
+
+def generate_different_len_requests(
+    input_lengths: list[int],
+    seed: int = 0,
+) -> list[RequestSpec]:
+    """Generate fresh single-output requests for the prefill length sweep."""
+    rng = Random(seed)
+    return [
+        RequestSpec(
+            request_id=request_id,
+            arrival_time=0.0,
+            prompt_token_ids=[rng.randint(0, 10000) for _ in range(input_length)],
+            sampling_params=SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=1),
+        )
+        for request_id, input_length in enumerate(input_lengths)
+    ]
