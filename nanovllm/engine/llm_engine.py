@@ -76,7 +76,10 @@ class LLMEngine:
             tuple(seq.seq_id for seq in self.scheduler.running) if on_step is not None else ()
         )
         preempted_seq_ids: list[int] = []
-        seqs, is_prefill = self.scheduler.schedule(
+        # seqs, is_prefill = self.scheduler.schedule(
+        #     on_preempt=preempted_seq_ids.append if on_step is not None else None,
+        # )
+        seqs, is_prefill = self.scheduler.sarathi_schedule(
             on_preempt=preempted_seq_ids.append if on_step is not None else None,
         )
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
