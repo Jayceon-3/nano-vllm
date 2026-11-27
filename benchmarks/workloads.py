@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import isfinite
 from random import Random
 from nanovllm import SamplingParams
 
@@ -6,7 +7,7 @@ from nanovllm import SamplingParams
 @dataclass
 class RequestSpec:
   request_id: int
-  arrival_time: int
+  arrival_time: float
   prompt_token_ids: list[int]
   sampling_params: SamplingParams
 
@@ -53,3 +54,24 @@ def generate_random_requests(
 
     request_list.sort(key=lambda request: (request.arrival_time, request.request_id))
     return request_list
+
+
+def generate_long_prefill_requests(delay_ms: float, seed: int = 0) -> list[RequestSpec]:
+    """Insert B's long prefill while A is generating a long output."""
+    if not isfinite(delay_ms) or delay_ms <= 0:
+        raise ValueError("--long-prefill-delay-ms must be finite and > 0")
+
+    rng = Random(seed)
+    requests = [
+        (0, 0.0, 32, 1024),  # A
+        (1, delay_ms / 1000, 3072, 16),  # B
+    ]
+    return [
+        RequestSpec(
+            request_id=request_id,
+            arrival_time=arrival_time,
+            prompt_token_ids=[rng.randint(0, 10000) for _ in range(prompt_length)],
+            sampling_params=SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_length),
+        )
+        for request_id, arrival_time, prompt_length, output_length in requests
+    ]

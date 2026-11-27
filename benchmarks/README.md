@@ -4,11 +4,14 @@
 
 Compare the baseline scheduler under random arrivals and all requests arriving at
 time zero, using the same request IDs, prompt tokens, and sampling parameters.
+The `long-prefill` workload isolates how an arriving long prompt affects a
+request that's already decoding.
 
 ## File Responsibilities
 
 - `bench_online.py`: Simulate requests arriving over time, run the benchmark, and summarize results.
 - `workloads.py`: Generate request input lengths, output lengths, and arrival times.
+- `plot_long_prefill.py`: Verify decode overlap and plot request A's ITL from a trace.
 - `bench.py` in the repository root: The existing offline benchmark.
 
 ## Environment and Baseline Version
@@ -17,11 +20,15 @@ Record the GPU, model, dependency versions, and baseline commit.
 
 ## Workload Configuration
 
-Defaults are 256 requests, seed 0, input and output lengths independently sampled
-from 100 to 1024 tokens, and integer random arrival times in `[0, 30)` seconds.
-The `all-at-once` pattern assigns every arrival time to zero and submits requests
-in request-ID order. Both patterns consume the same random draws, keeping each
-request's contents identical across runs.
+| Arrival pattern | Workload |
+| --- | --- |
+| `random` (default) | Integer random arrival times in `[0, 30)` seconds |
+| `all-at-once` | All requests arrive at time zero in request-ID order |
+| `long-prefill` | A starts decoding, then B arrives with a long prompt at a fixed offset |
+
+`random` and `all-at-once` default to 256 requests, seed 0, and independently
+sampled input and output lengths from 100 to 1024 tokens. Both patterns consume
+the same random draws, keeping each request's contents identical across runs.
 
 The all-at-once pattern follows the arrival behavior of the root `bench.py`.
 Request contents come from this workload generator, whose random-draw order
@@ -36,6 +43,7 @@ Run from the repository root after activating the environment.
 source init_env.sh
 python -m benchmarks.bench_online --arrival-pattern random
 python -m benchmarks.bench_online --arrival-pattern all-at-once
+python -m benchmarks.bench_online --arrival-pattern long-prefill
 ```
 
 Each invocation runs one experiment and initializes and warms up its own model.
@@ -56,8 +64,38 @@ Adjust the workload configuration through command-line arguments.
 python -m benchmarks.bench_online --arrival-pattern random --num-seqs 256 --time-interval 30 --seed 0
 ```
 
-`--max-input-len`, `--max-output-len`, and `--model` configure the length limits
-and model path. Running without arguments retains the random-arrival experiment.
+`--max-input-len` and `--max-output-len` set the length limits for `random` and
+`all-at-once`. `--model` selects the model for any pattern.
+
+### Long Prefill During Decode
+
+| Request | Planned arrival | Prompt tokens | Output tokens |
+| --- | --- | --- | --- |
+| A (`0`) | 0 ms | 32 | 1024 |
+| B (`1`) | 500 ms | 3072 | 16 |
+
+Both requests ignore EOS to yield fixed output counts. The seed determines
+prompt token IDs. Use the same seed and `--long-prefill-delay-ms` when comparing
+schedulers. The summary records the planned arrivals and token counts. The
+random workload length and request-count arguments apply to the other patterns.
+Before collecting timings, the benchmark warms up a two-request decode batch
+using separate prompts.
+
+```bash
+python -m benchmarks.bench_online --arrival-pattern long-prefill \
+  --trace-output results/long-prefill.trace.json
+python -m benchmarks.plot_long_prefill results/long-prefill.trace.json \
+  --output results/long-prefill.itl.png
+```
+
+The plotting command requires `gnuplot` with the `pngcairo` terminal. It checks
+that A has already emitted a decode token when B is due and is still waiting for
+decode when B's prefill starts. If the planned arrival is outside A's decode
+window on your machine, choose a delay inside the reported window with
+`--long-prefill-delay-ms`.
+The dashed line marks B's planned arrival and the shaded intervals show the steps
+that run B before its first output token. Each ITL is plotted at the time its
+second token is observed.
 
 ## Metric Definitions
 

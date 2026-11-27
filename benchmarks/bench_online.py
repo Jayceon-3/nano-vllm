@@ -12,7 +12,7 @@ import numpy as np
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.llm_engine import StepTrace
 from benchmarks.trace import StepRecord, analyze_longest_itls
-from benchmarks.workloads import RequestSpec, generate_random_requests
+from benchmarks.workloads import RequestSpec, generate_long_prefill_requests, generate_random_requests
 
 
 @dataclass
@@ -173,12 +173,12 @@ def write_json(path: Path, payload: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark random arrivals or all requests arriving at time zero.",
+        description="Benchmark random arrivals, all-at-once arrivals, or a long prefill during decode.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--arrival-pattern",
-        choices=("random", "all-at-once"),
+        choices=("random", "all-at-once", "long-prefill"),
         default="random",
         help="Request arrival pattern.",
     )
@@ -186,6 +186,10 @@ def main():
     parser.add_argument("--max-input-len", type=int, default=1024)
     parser.add_argument("--max-output-len", type=int, default=1024)
     parser.add_argument("--time-interval", type=int, default=30, help="Random-arrival window in seconds.")
+    parser.add_argument(
+        "--long-prefill-delay-ms", type=float, default=500.0,
+        help="Planned arrival of the long prompt in milliseconds for the long-prefill pattern.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model", default="~/eecs442_scratch/models/Qwen3-0.6B")
     parser.add_argument(
@@ -206,18 +210,46 @@ def main():
     if trace_output is not None and summary_output.resolve() == trace_output.resolve():
         parser.error("--summary-output and --trace-output must point to different files")
 
-    request_list = generate_random_requests(
-        num_seqs=args.num_seqs,
-        max_input_len=args.max_input_len,
-        max_output_len=args.max_output_len,
-        time_interval=args.time_interval,
-        seed=args.seed,
-        arrival_pattern=args.arrival_pattern,
-    )
+    if args.arrival_pattern == "long-prefill":
+        try:
+            request_list = generate_long_prefill_requests(args.long_prefill_delay_ms, seed=args.seed)
+        except ValueError as error:
+            parser.error(str(error))
+        workload_configuration = {
+            "long_prefill_delay_ms": args.long_prefill_delay_ms,
+            "request_specs": [
+                {
+                    "request_id": request.request_id,
+                    "arrival_time": request.arrival_time,
+                    "input_tokens": len(request.prompt_token_ids),
+                    "max_output_tokens": request.sampling_params.max_tokens,
+                }
+                for request in request_list
+            ],
+        }
+    else:
+        request_list = generate_random_requests(
+            num_seqs=args.num_seqs,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            time_interval=args.time_interval,
+            seed=args.seed,
+            arrival_pattern=args.arrival_pattern,
+        )
+        workload_configuration = {
+            "num_seqs": args.num_seqs,
+            "max_input_len": args.max_input_len,
+            "max_output_len": args.max_output_len,
+            "time_interval": args.time_interval,
+        }
 
     path = os.path.expanduser(args.model)
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
     llm.generate(["Benchmark: "], SamplingParams())
+    if args.arrival_pattern == "long-prefill":
+        # Warm up the two-request decode batch using unrelated prompts.
+        warmup_prompts = [[request.request_id] * len(request.prompt_token_ids) for request in request_list]
+        llm.generate(warmup_prompts, SamplingParams(max_tokens=2, ignore_eos=True), use_tqdm=False)
     step_records = []
     results, elapsed_time = run_benchmark(
         llm,
@@ -235,10 +267,13 @@ def main():
     }
     summary = {
         "configuration": {
-            **vars(args),
+            "arrival_pattern": args.arrival_pattern,
+            "seed": args.seed,
             "model": path,
             "summary_output": str(summary_output),
             "trace_output": str(trace_output) if trace_output is not None else None,
+            "top_itls": args.top_itls,
+            **workload_configuration,
         },
         "total_requests": len(request_list),
         "completed_requests": len(results),
